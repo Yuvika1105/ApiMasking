@@ -1,0 +1,18 @@
+# Python Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest caches
+.pytest_cache/
+
+# Local data & temp directories
+temp/
+.streamlit/

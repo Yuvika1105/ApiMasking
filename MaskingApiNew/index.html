@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SafeGuard — Dynamic Data Masking Sandbox</title>
+  <meta name="description" content="End-to-end enterprise sandbox demonstrating decoupled dynamic data masking middleware with Presidio and spaCy using a Plug-in/Plug-out architecture." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Design tokens ──────────────────────────────────────────────────── */
+    :root {
+      --bg:            #080b14;
+      --surface:       #0f1220;
+      --surface-2:     #161b2e;
+      --surface-3:     #1c2338;
+      --border:        rgba(255,255,255,0.06);
+      --border-glow:   rgba(99,102,241,0.4);
+      --accent-1:      #6366f1;
+      --accent-2:      #0ea5e9;
+      --accent-3:      #a855f7;
+      --success:       #10b981;
+      --warning:       #f59e0b;
+      --danger:        #ef4444;
+      --text-1:        #f1f5f9;
+      --text-2:        #94a3b8;
+      --text-3:        #475569;
+      --radius:        16px;
+      --radius-sm:     10px;
+      --radius-xs:     6px;
+      --tag-client:    #f59e0b;
+      --tag-facility:  #10b981;
+      --tag-vehicle:   #a855f7;
+    }
+
+    /* ── Reset ──────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text-1);
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Background ambient glow ─────────────────────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 90% 60% at 15% 5%,  rgba(99,102,241,0.10) 0%, transparent 60%),
+        radial-gradient(ellipse 70% 50% at 85% 85%, rgba(168,85,247,0.09) 0%, transparent 55%),
+        radial-gradient(ellipse 60% 40% at 65% 0%,  rgba(14,165,233,0.07) 0%, transparent 50%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Layout ──────────────────────────────────────────────────────────── */
+    .page {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+    }
+
+    /* ── Topbar ──────────────────────────────────────────────────────────── */
+    .topbar {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 2rem;
+      height: 64px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(8,11,20,0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .topbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .brand-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      background: linear-gradient(135deg, var(--accent-1), var(--accent-3));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+      box-shadow: 0 0 20px rgba(99,102,241,0.35);
+    }
+
+    .brand-name {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text-1);
+      letter-spacing: -0.01em;
+    }
+
+    .brand-sub {
+      font-size: 0.68rem;
+      color: var(--text-3);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .version-tag {
+      font-size: 0.68rem;
+      color: var(--text-3);
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      padding: 0.2rem 0.6rem;
+      border-radius: 100px;
+      letter-spacing: 0.06em;
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────────── */
+    .sidebar {
+      border-right: 1px solid var(--border);
+      padding: 1.5rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      overflow-y: auto;
+      height: calc(100vh - 64px);
+      position: sticky;
+      top: 64px;
+    }
+
+    .sidebar-section-title {
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-3);
+      margin-bottom: 0.6rem;
+    }
+
+    /* ── Masking toggle (sidebar) ─────────────────────────────────────────── */
+    .toggle-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 1rem;
+      transition: border-color 0.3s, box-shadow 0.3s;
+    }
+
+    .toggle-card.active {
+      border-color: rgba(99,102,241,0.4);
+      box-shadow: 0 0 30px rgba(99,102,241,0.12);
+    }
+
+    .toggle-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.6rem;
+    }
+
+    .toggle-name {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text-1);
+    }
+
+    /* Switch */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 46px;
+      height: 25px;
+      flex-shrink: 0;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: var(--surface-3);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      transition: background 0.3s, border-color 0.3s;
+    }
+    .slider::before {
+      content: '';
+      position: absolute;
+      height: 17px; width: 17px;
+      left: 3px; bottom: 3px;
+      background: var(--text-3);
+      border-radius: 50%;
+      transition: transform 0.3s, background 0.3s, box-shadow 0.3s;
+    }
+    .switch input:checked + .slider {
+      background: rgba(99,102,241,0.2);
+      border-color: var(--accent-1);
+    }
+    .switch input:checked + .slider::before {
+      transform: translateX(21px);
+      background: var(--accent-1);
+      box-shadow: 0 0 10px rgba(99,102,241,0.8);
+    }
+
+    .toggle-desc {
+      font-size: 0.73rem;
+      color: var(--text-3);
+      line-height: 1.5;
+    }
+
+    /* Status pill */
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 0.25rem 0.65rem;
+      border-radius: 100px;
+      margin-top: 0.65rem;
+    }
+    .status-pill.off { background: rgba(71,85,105,0.3); color: var(--text-3); border: 1px solid rgba(71,85,105,0.2); }
+    .status-pill.on  { background: rgba(99,102,241,0.18); color: #a5b4fc; border: 1px solid rgba(99,102,241,0.3); }
+    .status-pill.on::before {
+      content: ''; width: 5px; height: 5px; border-radius: 50%;
+      background: var(--accent-1); box-shadow: 0 0 6px var(--accent-1);
+      animation: pulse 1.8s ease-in-out infinite;
+    }
+
+    /* ── Architecture Flow (sidebar) ─────────────────────────────────────── */
+    .arch-flow {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .arch-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.7rem;
+      position: relative;
+    }
+
+    .arch-step + .arch-step { margin-top: 0; }
+
+    .arch-col {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .arch-dot {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      flex-shrink: 0;
+      transition: box-shadow 0.3s, background 0.3s;
+    }
+
+    .arch-line {
+      width: 1px;
+      flex: 1;
+      min-height: 18px;
+      background: var(--border);
+      margin: 2px 0;
+    }
+
+    .arch-line.active { background: var(--accent-1); opacity: 0.4; }
+
+    .arch-info {
+      padding: 4px 0 18px;
+    }
+
+    .arch-info-name {
+      font-size: 0.76rem;
+      font-weight: 600;
+      color: var(--text-1);
+    }
+
+    .arch-info-desc {
+      font-size: 0.67rem;
+      color: var(--text-3);
+      margin-top: 1px;
+    }
+
+    .arch-dot.ui       { background: rgba(14,165,233,0.15);  border: 1px solid rgba(14,165,233,0.3);  color: #38bdf8; }
+    .arch-dot.rag      { background: rgba(245,158,11,0.12);  border: 1px solid rgba(245,158,11,0.25); color: #fbbf24; }
+    .arch-dot.mask     { background: rgba(99,102,241,0.15);  border: 1px solid rgba(99,102,241,0.3);  color: #a5b4fc; transition: box-shadow 0.4s; }
+    .arch-dot.mask.active { box-shadow: 0 0 18px rgba(99,102,241,0.6); }
+    .arch-dot.screen   { background: rgba(16,185,129,0.12);  border: 1px solid rgba(16,185,129,0.25); color: #34d399; }
+
+    /* ── Entity legend ────────────────────────────────────────────────────── */
+    .legend {
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 0.73rem;
+    }
+
+    .legend-chip {
+      font-size: 0.62rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .chip-client   { background: rgba(245,158,11,0.15);  color: var(--tag-client);  border: 1px solid rgba(245,158,11,0.3); }
+    .chip-facility { background: rgba(16,185,129,0.12);  color: var(--tag-facility);border: 1px solid rgba(16,185,129,0.25); }
+    .chip-vehicle  { background: rgba(168,85,247,0.12);  color: var(--tag-vehicle); border: 1px solid rgba(168,85,247,0.25); }
+
+    .legend-desc { color: var(--text-3); }
+
+    /* ── Main content ─────────────────────────────────────────────────────── */
+    .main {
+      display: flex;
+      flex-direction: column;
+      padding: 1.75rem 2rem;
+      gap: 1.25rem;
+      overflow-y: auto;
+      height: calc(100vh - 64px);
+    }
+
+    /* ── Page hero ───────────────────────────────────────────────────────── */
+    .hero {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    .hero-text h1 {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.85rem;
+      font-weight: 800;
+      line-height: 1.15;
+      background: linear-gradient(135deg, #e0e7ff 20%, #a5b4fc 55%, #818cf8 90%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero-text p {
+      font-size: 0.83rem;
+      color: var(--text-3);
+      margin-top: 0.35rem;
+      line-height: 1.6;
+    }
+
+    .badge-row {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-top: 0.65rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      background: rgba(99,102,241,0.12);
+      border: 1px solid rgba(99,102,241,0.25);
+      border-radius: 100px;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.67rem;
+      font-weight: 600;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: #a5b4fc;
+    }
+
+    .badge.green {
+      background: rgba(16,185,129,0.1);
+      border-color: rgba(16,185,129,0.25);
+      color: #34d399;
+    }
+
+    /* ── Sample query chips ──────────────────────────────────────────────── */
+    .sample-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--text-3);
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      margin-bottom: 0.5rem;
+    }
+
+    .sample-chips {
+      display: flex;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+    }
+
+    .sample-chip {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      padding: 0.45rem 0.85rem;
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--text-2);
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      white-space: nowrap;
+    }
+
+    .sample-chip:hover {
+      background: var(--surface-2);
+      border-color: rgba(99,102,241,0.35);
+      color: var(--text-1);
+      transform: translateY(-1px);
+    }
+
+    .sample-chip .chip-icon { font-size: 0.85rem; }
+
+    /* ── Input bar ───────────────────────────────────────────────────────── */
+    .input-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.1rem 1.25rem;
+      transition: border-color 0.3s;
+    }
+
+    .input-card:focus-within { border-color: rgba(99,102,241,0.4); }
+
+    .input-row {
+      display: flex;
+      gap: 0.65rem;
+      align-items: stretch;
+    }
+
+    #userInput {
+      flex: 1;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 0.8rem 1rem;
+      color: var(--text-1);
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.25s, box-shadow 0.25s;
+    }
+    #userInput::placeholder { color: var(--text-3); }
+    #userInput:focus {
+      border-color: var(--accent-1);
+      box-shadow: 0 0 0 3px rgba(99,102,241,0.13);
+    }
+
+    #sendBtn {
+      padding: 0 1.4rem;
+      background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+      border: none;
+      border-radius: var(--radius-sm);
+      color: #fff;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      font-size: 0.88rem;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.2s, transform 0.15s, box-shadow 0.2s;
+      box-shadow: 0 4px 20px rgba(99,102,241,0.38);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+    #sendBtn:hover  { opacity: 0.9; transform: translateY(-1px); box-shadow: 0 6px 28px rgba(99,102,241,0.5); }
+    #sendBtn:active { transform: translateY(0); }
+    #sendBtn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    /* ── Output panels ───────────────────────────────────────────────────── */
+    .panels-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.1rem;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.4rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      min-height: 300px;
+    }
+
+    .panel.admin-panel { border-color: rgba(245,158,11,0.12); }
+    .panel.user-panel  { border-color: rgba(16,185,129,0.12); }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .panel-left {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+    }
+
+    .panel-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.9rem;
+      flex-shrink: 0;
+    }
+    .panel-icon.admin { background: rgba(245,158,11,0.12); }
+    .panel-icon.user  { background: rgba(16,185,129,0.12); }
+
+    .panel-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.98rem;
+      font-weight: 600;
+      color: var(--text-1);
+    }
+
+    .panel-sub {
+      font-size: 0.7rem;
+      color: var(--text-3);
+      margin-top: 1px;
+    }
+
+    .panel-tag {
+      font-size: 0.64rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 0.2rem 0.55rem;
+      border-radius: 100px;
+    }
+    .panel-tag.admin { background: rgba(245,158,11,0.1);  color: #fbbf24; border: 1px solid rgba(245,158,11,0.22); }
+    .panel-tag.user  { background: rgba(16,185,129,0.1);  color: #34d399; border: 1px solid rgba(16,185,129,0.22); }
+
+    .output-box {
+      flex: 1;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 0.95rem 1rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      line-height: 1.75;
+      color: var(--text-2);
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-y: auto;
+      min-height: 200px;
+      max-height: 380px;
+      transition: border-color 0.25s;
+      position: relative;
+    }
+
+    .output-box.admin-box { border-color: rgba(245,158,11,0.1); }
+    .output-box.user-box  { border-color: rgba(16,185,129,0.1); }
+
+    .output-box.has-content { color: var(--text-1); }
+
+    .output-box.placeholder::before {
+      content: attr(data-placeholder);
+      color: var(--text-3);
+      font-style: italic;
+      font-size: 0.78rem;
+    }
+
+    /* Entity tag highlight spans inside output box */
+    .output-box .tag-client   { color: var(--tag-client);  background: rgba(245,158,11,0.12);  padding: 0 3px; border-radius: 3px; font-weight: 600; }
+    .output-box .tag-facility { color: var(--tag-facility);background: rgba(16,185,129,0.1);   padding: 0 3px; border-radius: 3px; font-weight: 600; }
+    .output-box .tag-vehicle  { color: var(--tag-vehicle); background: rgba(168,85,247,0.12);  padding: 0 3px; border-radius: 3px; font-weight: 600; }
+
+    /* ── Shimmer loader ──────────────────────────────────────────────────── */
+    @keyframes shimmer {
+      0%   { background-position: -600px 0; }
+      100% { background-position:  600px 0; }
+    }
+
+    .loading-shimmer {
+      background: linear-gradient(90deg,
+        var(--surface-2) 25%,
+        rgba(99,102,241,0.07) 50%,
+        var(--surface-2) 75%);
+      background-size: 600px 100%;
+      animation: shimmer 1.5s linear infinite;
+    }
+
+    /* ── Chat history ────────────────────────────────────────────────────── */
+    .history-section {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .history-label {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-3);
+    }
+
+    .history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      max-height: 160px;
+      overflow-y: auto;
+    }
+
+    .history-item {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      padding: 0.5rem 0.8rem;
+      font-size: 0.75rem;
+      display: flex;
+      align-items: flex-start;
+      gap: 0.55rem;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .history-item:hover {
+      background: var(--surface-3);
+      border-color: rgba(99,102,241,0.2);
+    }
+
+    .history-item .hi-icon { flex-shrink: 0; opacity: 0.6; }
+
+    .history-item .hi-text {
+      color: var(--text-2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.4;
+    }
+
+    .history-item .hi-masked {
+      flex-shrink: 0;
+      font-size: 0.62rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 100px;
+      background: rgba(99,102,241,0.15);
+      color: #a5b4fc;
+    }
+
+    .history-item .hi-raw {
+      flex-shrink: 0;
+      font-size: 0.62rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 100px;
+      background: rgba(71,85,105,0.3);
+      color: var(--text-3);
+    }
+
+    .history-empty {
+      font-size: 0.75rem;
+      color: var(--text-3);
+      font-style: italic;
+      padding: 0.3rem 0.2rem;
+    }
+
+    /* ── Diff indicator (masked count) ──────────────────────────────────── */
+    .diff-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      font-size: 0.72rem;
+      color: var(--text-3);
+      padding: 0.5rem 0.75rem;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      flex-wrap: wrap;
+    }
+
+    .diff-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.15rem 0.55rem;
+      border-radius: 100px;
+      font-size: 0.68rem;
+      font-weight: 700;
+    }
+    .diff-chip.client   { background: rgba(245,158,11,0.1);  color: var(--tag-client);  border: 1px solid rgba(245,158,11,0.2); }
+    .diff-chip.facility { background: rgba(16,185,129,0.1);  color: var(--tag-facility);border: 1px solid rgba(16,185,129,0.2); }
+    .diff-chip.vehicle  { background: rgba(168,85,247,0.1);  color: var(--tag-vehicle); border: 1px solid rgba(168,85,247,0.2); }
+
+    #diffBar { display: none; }
+    #diffBar.visible { display: flex; }
+
+    /* ── Toast ───────────────────────────────────────────────────────────── */
+    #toast {
+      position: fixed;
+      bottom: 1.75rem;
+      right: 1.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 0.8rem 1.15rem;
+      font-size: 0.82rem;
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.55);
+      transform: translateY(130%);
+      opacity: 0;
+      transition: transform 0.38s cubic-bezier(0.34,1.56,0.64,1), opacity 0.3s;
+      z-index: 999;
+      max-width: 360px;
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
+    #toast.success { border-color: rgba(16,185,129,0.4); }
+    #toast.error   { border-color: rgba(239,68,68,0.4); }
+    #toast.info    { border-color: rgba(99,102,241,0.4); }
+
+    /* ── Scrollbar ───────────────────────────────────────────────────────── */
+    ::-webkit-scrollbar       { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.07); border-radius: 99px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.13); }
+
+    /* ── Animations ──────────────────────────────────────────────────────── */
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%       { opacity: 0.4; transform: scale(1.5); }
+    }
+
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .fade-in { animation: fadeInUp 0.35s ease forwards; }
+
+    /* ── Responsive ──────────────────────────────────────────────────────── */
+    @media (max-width: 900px) {
+      .page { grid-template-columns: 1fr; grid-template-rows: auto auto 1fr; }
+      .sidebar { height: auto; position: static; border-right: none; border-bottom: 1px solid var(--border); flex-direction: row; flex-wrap: wrap; }
+      .main { height: auto; }
+      .panels-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- ── Topbar ──────────────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="brand-icon">🛡</div>
+      <div>
+        <div class="brand-name">SafeGuard</div>
+        <div class="brand-sub">Dynamic Data Masking Sandbox</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="version-tag">v2.0 · Presidio + spaCy</span>
+      <span class="version-tag" id="serverStatus">⚡ Connecting…</span>
+    </div>
+  </header>
+
+  <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+
+    <!-- Masking Toggle -->
+    <div>
+      <div class="sidebar-section-title">Middleware Control</div>
+      <div class="toggle-card" id="toggleCard">
+        <div class="toggle-header">
+          <span class="toggle-name">Data Masking Middleware</span>
+          <label class="switch">
+            <input type="checkbox" id="maskingToggle" onchange="updateToggleUI()" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="toggle-desc">Plug-in the Presidio microservice as an interception layer between the RAG backend and user display.</div>
+        <div class="status-pill off" id="statusPill">Middleware Off</div>
+      </div>
+    </div>
+
+    <!-- Architecture Flow -->
+    <div>
+      <div class="sidebar-section-title">Request Flow</div>
+      <div class="arch-flow">
+        <div class="arch-step">
+          <div class="arch-col">
+            <div class="arch-dot ui">UI</div>
+            <div class="arch-line" id="line1"></div>
+          </div>
+          <div class="arch-info">
+            <div class="arch-info-name">Frontend Gateway</div>
+            <div class="arch-info-desc">HTML/JS — sendQuery()</div>
+          </div>
+        </div>
+        <div class="arch-step">
+          <div class="arch-col">
+            <div class="arch-dot rag">RAG</div>
+            <div class="arch-line" id="line2"></div>
+          </div>
+          <div class="arch-info">
+            <div class="arch-info-name">Mock RAG Backend</div>
+            <div class="arch-info-desc">POST /api/v1/query</div>
+          </div>
+        </div>
+        <div class="arch-step">
+          <div class="arch-col">
+            <div class="arch-dot mask" id="archMaskDot">PII</div>
+            <div class="arch-line" id="line3"></div>
+          </div>
+          <div class="arch-info">
+            <div class="arch-info-name">Presidio Middleware</div>
+            <div class="arch-info-desc">POST /api/v1/mask</div>
+          </div>
+        </div>
+        <div class="arch-step">
+          <div class="arch-col">
+            <div class="arch-dot screen">OUT</div>
+          </div>
+          <div class="arch-info">
+            <div class="arch-info-name">User Display</div>
+            <div class="arch-info-desc">Safe sanitised output</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Entity Legend -->
+    <div>
+      <div class="sidebar-section-title">Entity Tag Legend</div>
+      <div class="legend">
+        <div class="legend-item">
+          <span class="legend-chip chip-client">&lt;CLIENT_REPRESENTATIVE&gt;</span>
+        </div>
+        <div class="legend-item">
+          <span style="font-size:0.68rem; color:var(--text-3); padding-left:2px;">→ Detected PERSON entities</span>
+        </div>
+        <div class="legend-item" style="margin-top:0.3rem;">
+          <span class="legend-chip chip-facility">&lt;MANUFACTURING_FACILITY&gt;</span>
+        </div>
+        <div class="legend-item">
+          <span style="font-size:0.68rem; color:var(--text-3); padding-left:2px;">→ Detected LOCATION entities</span>
+        </div>
+        <div class="legend-item" style="margin-top:0.3rem;">
+          <span class="legend-chip chip-vehicle">&lt;VEHICLE_MODEL&gt;</span>
+        </div>
+        <div class="legend-item">
+          <span style="font-size:0.68rem; color:var(--text-3); padding-left:2px;">→ Detected ORGANIZATION entities</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Query History -->
+    <div>
+      <div class="sidebar-section-title">Query History</div>
+      <div class="history-list" id="historyList">
+        <div class="history-empty">No queries yet</div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── Main content ────────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Hero -->
+    <div class="hero">
+      <div class="hero-text">
+        <h1>Dynamic Data Masking<br/>RAG Sandbox</h1>
+        <p>Decoupled middleware intercepting sensitive PII between the RAG backend and user display layer.</p>
+        <div class="badge-row">
+          <span class="badge">Plug-in / Plug-out Architecture</span>
+          <span class="badge green">Microsoft Presidio · spaCy NER</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sample query chips -->
+    <div>
+      <div class="sample-label">Quick demo queries</div>
+      <div class="sample-chips" id="sampleChips">
+        <div class="sample-chip" onclick="useQuery('Show me the Q3 production allocation report')">
+          <span class="chip-icon">📊</span> Q3 Production Report
+        </div>
+        <div class="sample-chip" onclick="useQuery('Get the latest supplier escalation and procurement status')">
+          <span class="chip-icon">🔗</span> Supplier Escalation
+        </div>
+        <div class="sample-chip" onclick="useQuery('Retrieve the regulatory compliance and audit summary')">
+          <span class="chip-icon">✅</span> Compliance Audit
+        </div>
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div class="input-card">
+      <div class="input-row">
+        <input
+          id="userInput"
+          type="text"
+          placeholder="Ask the RAG backend anything… e.g. Show Q3 production allocation report"
+          autocomplete="off"
+          value="Show me the Q3 production allocation report"
+        />
+        <button id="sendBtn" onclick="sendQuery()">
+          <span>Send</span><span>↗</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Diff bar (shown only after masking runs) -->
+    <div class="diff-bar" id="diffBar">
+      <span style="color:var(--text-2); font-weight:600;">Entities masked:</span>
+      <span class="diff-chip client" id="countClient">0 × &lt;CLIENT_REPRESENTATIVE&gt;</span>
+      <span class="diff-chip facility" id="countFacility">0 × &lt;MANUFACTURING_FACILITY&gt;</span>
+      <span class="diff-chip vehicle" id="countVehicle">0 × &lt;VEHICLE_MODEL&gt;</span>
+    </div>
+
+    <!-- Output panels -->
+    <div class="panels-grid">
+
+      <!-- Admin Console -->
+      <div class="panel admin-panel">
+        <div class="panel-header">
+          <div class="panel-left">
+            <div class="panel-icon admin">🖥</div>
+            <div>
+              <div class="panel-title">Admin Console</div>
+              <div class="panel-sub">Raw backend generation — unmasked</div>
+            </div>
+          </div>
+          <span class="panel-tag admin">RAW OUTPUT</span>
+        </div>
+        <div
+          id="ragOutput"
+          class="output-box admin-box placeholder"
+          data-placeholder="Awaiting backend response…"
+        ></div>
+      </div>
+
+      <!-- User Screen -->
+      <div class="panel user-panel">
+        <div class="panel-header">
+          <div class="panel-left">
+            <div class="panel-icon user">👤</div>
+            <div>
+              <div class="panel-title">User Screen</div>
+              <div class="panel-sub">Final sanitised output shown to end-user</div>
+            </div>
+          </div>
+          <span class="panel-tag user">DISPLAY</span>
+        </div>
+        <div
+          id="uiDisplay"
+          class="output-box user-box placeholder"
+          data-placeholder="Final sanitised response will appear here…"
+        ></div>
+      </div>
+
+    </div>
+
+  </main>
+</div><!-- /page -->
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+  /* ──────────────────────────────────────────────────────────────────────────
+     Globals
+  ────────────────────────────────────────────────────────────────────────── */
+  let queryHistory = [];
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     Server health check
+  ────────────────────────────────────────────────────────────────────────── */
+  async function checkServerHealth() {
+    try {
+      const res = await fetch('http://127.0.0.1:8000/health');
+      if (res.ok) {
+        document.getElementById('serverStatus').textContent = '🟢 Server Online';
+      } else {
+        document.getElementById('serverStatus').textContent = '🔴 Server Error';
+      }
+    } catch {
+      document.getElementById('serverStatus').textContent = '🔴 Server Offline';
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     Load sample queries from API
+  ────────────────────────────────────────────────────────────────────────── */
+  async function loadSampleQueries() {
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/v1/queries/samples');
+      if (!res.ok) return;
+      const samples = await res.json();
+      const container = document.getElementById('sampleChips');
+      const icons = ['📊', '🔗', '✅'];
+      container.innerHTML = samples.map((s, i) => `
+        <div class="sample-chip" onclick="useQuery('${s.prompt.replace(/'/g, "\\'")}')">
+          <span class="chip-icon">${icons[i] || '💬'}</span> ${s.label}
+        </div>
+      `).join('');
+    } catch {
+      /* keep static chips */
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     UI helpers
+  ────────────────────────────────────────────────────────────────────────── */
+  function updateToggleUI() {
+    const enabled = document.getElementById('maskingToggle').checked;
+    const pill    = document.getElementById('statusPill');
+    const card    = document.getElementById('toggleCard');
+    const dot     = document.getElementById('archMaskDot');
+    const line2   = document.getElementById('line2');
+
+    if (enabled) {
+      pill.textContent = 'Middleware Active';
+      pill.className   = 'status-pill on';
+      card.classList.add('active');
+      dot.classList.add('active');
+      line2.classList.add('active');
+    } else {
+      pill.textContent = 'Middleware Off';
+      pill.className   = 'status-pill off';
+      card.classList.remove('active');
+      dot.classList.remove('active');
+      line2.classList.remove('active');
+      document.getElementById('diffBar').classList.remove('visible');
+    }
+  }
+
+  function useQuery(text) {
+    document.getElementById('userInput').value = text;
+    document.getElementById('userInput').focus();
+  }
+
+  function showToast(msg, type = 'info') {
+    const t = document.getElementById('toast');
+    const icon = type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️';
+    t.innerHTML = `<span>${icon}</span><span>${msg}</span>`;
+    t.className = `show ${type}`;
+    clearTimeout(t._timer);
+    t._timer = setTimeout(() => { t.className = ''; }, 4000);
+  }
+
+  function setLoading(on) {
+    const btn    = document.getElementById('sendBtn');
+    const ragBox = document.getElementById('ragOutput');
+    const uiBox  = document.getElementById('uiDisplay');
+
+    btn.disabled = on;
+    btn.innerHTML = on
+      ? '<span>Processing…</span>'
+      : '<span>Send</span><span>↗</span>';
+
+    if (on) {
+      ragBox.className = 'output-box admin-box loading-shimmer';
+      ragBox.textContent = '';
+      uiBox.className  = 'output-box user-box loading-shimmer';
+      uiBox.textContent = '';
+      document.getElementById('diffBar').classList.remove('visible');
+    } else {
+      ragBox.className = 'output-box admin-box';
+      uiBox.className  = 'output-box user-box';
+    }
+  }
+
+  function setBoxContent(id, html, isHTML = false) {
+    const el = document.getElementById(id);
+    el.classList.remove('placeholder', 'loading-shimmer');
+    el.classList.add('has-content', 'fade-in');
+    if (isHTML) {
+      el.innerHTML = html;
+    } else {
+      el.textContent = html;
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     Highlight masking tags in the user screen output
+  ────────────────────────────────────────────────────────────────────────── */
+  function highlightTags(text) {
+    return text
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/&lt;CLIENT_REPRESENTATIVE&gt;/g,   '<span class="tag-client">&lt;CLIENT_REPRESENTATIVE&gt;</span>')
+      .replace(/&lt;MANUFACTURING_FACILITY&gt;/g,  '<span class="tag-facility">&lt;MANUFACTURING_FACILITY&gt;</span>')
+      .replace(/&lt;VEHICLE_MODEL&gt;/g,            '<span class="tag-vehicle">&lt;VEHICLE_MODEL&gt;</span>');
+  }
+
+  function countTags(text) {
+    return {
+      client:   (text.match(/<CLIENT_REPRESENTATIVE>/g)   || []).length,
+      facility: (text.match(/<MANUFACTURING_FACILITY>/g)  || []).length,
+      vehicle:  (text.match(/<VEHICLE_MODEL>/g)           || []).length,
+    };
+  }
+
+  function showDiffBar(masked) {
+    const counts = countTags(masked);
+    const total  = counts.client + counts.facility + counts.vehicle;
+    if (total === 0) return;
+    document.getElementById('countClient').textContent   = `${counts.client} × <CLIENT_REPRESENTATIVE>`;
+    document.getElementById('countFacility').textContent = `${counts.facility} × <MANUFACTURING_FACILITY>`;
+    document.getElementById('countVehicle').textContent  = `${counts.vehicle} × <VEHICLE_MODEL>`;
+    document.getElementById('diffBar').classList.add('visible');
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     Query history
+  ────────────────────────────────────────────────────────────────────────── */
+  function addToHistory(prompt, masked) {
+    queryHistory.unshift({ prompt, masked });
+    if (queryHistory.length > 8) queryHistory.pop();
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const list = document.getElementById('historyList');
+    if (queryHistory.length === 0) {
+      list.innerHTML = '<div class="history-empty">No queries yet</div>';
+      return;
+    }
+    list.innerHTML = queryHistory.map(h => `
+      <div class="history-item" onclick="useQuery('${h.prompt.replace(/'/g, "\\'")}')">
+        <span class="hi-icon">💬</span>
+        <span class="hi-text">${h.prompt}</span>
+        <span class="${h.masked ? 'hi-masked' : 'hi-raw'}">${h.masked ? 'Masked' : 'Raw'}</span>
+      </div>
+    `).join('');
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     Step 2 — Frontend Interception & Gateway Logic
+     (Exactly as specified in the architecture brief)
+  ────────────────────────────────────────────────────────────────────────── */
+  async function sendQuery() {
+    const query           = document.getElementById('userInput').value;
+    const standardRAGBox  = document.getElementById('ragOutput');
+    const screenDisplayBox = document.getElementById('uiDisplay');
+    const maskingEnabled  = document.getElementById('maskingToggle').checked;
+
+    if (!query.trim()) {
+      showToast('Please enter a query first.', 'error');
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      // 1. Fetch data from our Mock RAG Backend
+      const ragResponse = await fetch('http://127.0.0.1:8000/api/v1/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: query })
+      });
+
+      const ragData = await ragResponse.json();
+
+      setLoading(false);
+      setBoxContent('ragOutput', ragData.raw_response);
+
+      // 2. Conditional Middleware Interception (Plug-in / Plug-out)
+      if (maskingEnabled) {
+        try {
+          const maskResponse = await fetch('http://127.0.0.1:8000/api/v1/mask', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ raw_response: ragData.raw_response })
+          });
+          const maskedData = await maskResponse.json();
+
+          // Render with coloured entity tags
+          setBoxContent('uiDisplay', highlightTags(maskedData.masked_response), true);
+          showDiffBar(maskedData.masked_response);
+          showToast('Masking middleware applied — sensitive data redacted.', 'success');
+          addToHistory(query, true);
+        } catch (error) {
+          setBoxContent('uiDisplay', 'Security Block: Response contained client details and could not be verified.');
+          showToast('Masking service unreachable — security fallback activated.', 'error');
+          addToHistory(query, false);
+        }
+      } else {
+        setBoxContent('uiDisplay', ragData.raw_response);
+        showToast('Query complete. Middleware is currently disabled.', 'info');
+        addToHistory(query, false);
+      }
+
+    } catch (err) {
+      setLoading(false);
+      setBoxContent('ragOutput', '⚠ Could not reach the RAG backend.\n\nEnsure the FastAPI server is running:\n\n  uvicorn main:app --reload --port 8000');
+      setBoxContent('uiDisplay', '—');
+      showToast('Backend unreachable. Run: uvicorn main:app --reload', 'error');
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     Init
+  ────────────────────────────────────────────────────────────────────────── */
+  document.getElementById('userInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') sendQuery();
+  });
+
+  // Bootstrap
+  checkServerHealth();
+  loadSampleQueries();
+  renderHistory();
+</script>
+</body>
+</html>
