@@ -19,10 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
-from presidio_analyzer.nlp_engine import NlpEngineProvider
-from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
+from safeguard.masker import SafeGuardMasker
 
 # ── App instance ──────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -91,174 +88,8 @@ class SampleQuery(BaseModel):
     description: str
 
 
-# ── Presidio lazy singleton ───────────────────────────────────────────────────
-_analyzer: AnalyzerEngine | None = None
-_anonymizer: AnonymizerEngine | None = None
-
-
-def _get_presidio():
-    """
-    Initialise the Presidio AnalyzerEngine (with spaCy en_core_web_sm) and
-    AnonymizerEngine exactly once; reuse on every subsequent call.
-    """
-    global _analyzer, _anonymizer
-    if _analyzer is None:
-        try:
-            import spacy
-            import spacy.util
-            if not spacy.util.is_package("en_core_web_sm"):
-                spacy.cli.download("en_core_web_sm")
-        except Exception as e:
-            print(f"Failed to auto-download spaCy model: {e}")
-
-        registry = RecognizerRegistry()
-        registry.load_predefined_recognizers()
-
-        spacy_config = {
-            "nlp_engine_name": "spacy",
-            "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
-        }
-        nlp_provider = NlpEngineProvider(nlp_configuration=spacy_config)
-        nlp_engine = nlp_provider.create_engine()
-
-        _analyzer = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
-        _anonymizer = AnonymizerEngine()
-
-    return _analyzer, _anonymizer
-
-
-# ── PII masking helper functions ──────────────────────────────────────────────
-
-def _mask_name(text: str) -> str:
-    """Show only first and last letter of each word: 'John Carter' → 'J**n C****r'."""
-    parts = text.split()
-    masked = []
-    for part in parts:
-        if len(part) <= 2:
-            masked.append(part)
-        else:
-            masked.append(part[0] + '*' * (len(part) - 2) + part[-1])
-    return ' '.join(masked)
-
-
-
-def _mask_phone(text: str) -> str:
-    """Show only last 3 digits, replace rest with X: '9876543210' → 'XXXXXXX210'."""
-    digits = re.sub(r'\D', '', text)
-    if not digits or len(digits) <= 3:
-        return 'X' * len(text)
-    show_from = len(digits) - 3
-    digit_idx = 0
-    result = []
-    for ch in text:
-        if ch.isdigit():
-            result.append(ch if digit_idx >= show_from else 'X')
-            digit_idx += 1
-        else:
-            result.append(ch)
-    return ''.join(result)
-
-
-def _mask_email(text: str) -> str:
-    """Mask email keeping first & last char of local+domain: 'john@gmail.com' → 'j**n@g**l.com'."""
-    try:
-        local, domain = text.split('@', 1)
-        d_parts = domain.rsplit('.', 1)
-        d_name = d_parts[0]
-        d_ext = d_parts[1] if len(d_parts) > 1 else ''
-
-        def _partial(s: str) -> str:
-            if len(s) <= 1:
-                return s
-            if len(s) == 2:
-                return s[0] + '*'
-            return s[0] + '*' * (len(s) - 2) + s[-1]
-
-        return f"{_partial(local)}@{_partial(d_name)}.{d_ext}"
-    except Exception:
-        return '***@***.***'
-
-
-# ── Entity → tag mapping (Step 3) ────────────────────────────────────────────
-PRESIDIO_ENTITIES = ["PERSON", "LOCATION", "ORGANIZATION", "PHONE_NUMBER", "EMAIL_ADDRESS"]
-
-OPERATORS = {
-    "PERSON":        OperatorConfig("custom", {"lambda": _mask_name}),
-    "LOCATION":      OperatorConfig("replace", {"new_value": "<MANUFACTURING_FACILITY>"}),
-    "ORGANIZATION":  OperatorConfig("replace", {"new_value": "<VEHICLE_MODEL>"}),
-    "PHONE_NUMBER":  OperatorConfig("custom", {"lambda": _mask_phone}),
-    "EMAIL_ADDRESS": OperatorConfig("custom", {"lambda": _mask_email}),
-}
-
-
-# ── Recursive format-agnostic masking helper (Step 3) ────────────────────────
-def recursive_mask_data_structure(
-    data: Any,
-    analyzer: AnalyzerEngine,
-    anonymizer: AnonymizerEngine,
-    operators: dict,
-    entities: list,
-) -> Any:
-    """
-    Walk any combination of dicts / lists / strings and apply Presidio masking
-    to every string value while leaving JSON structural keys untouched.
-    """
-    if isinstance(data, dict):
-        return {
-            k: recursive_mask_data_structure(v, analyzer, anonymizer, operators, entities)
-            for k, v in data.items()
-        }
-    elif isinstance(data, list):
-        return [
-            recursive_mask_data_structure(i, analyzer, anonymizer, operators, entities)
-            for i in data
-        ]
-    elif isinstance(data, str):
-        results = analyzer.analyze(text=data, language="en", entities=entities)
-        return anonymizer.anonymize(
-            text=data, analyzer_results=results, operators=operators
-        ).text
-    return data
-
-
-# ── Custom word rules (Step 4) ───────────────────────────────────────────────
-
-def apply_custom_rules(text: str, rules: List[CustomRule]) -> str:
-    """
-    Apply user-defined word masking rules on top of Presidio output.
-    Each rule specifies:
-      - pattern   : the word/prefix/suffix to match
-      - position  : prefix / suffix / contains / exact
-      - masking_type:
-            "replace"    -> substitute matched token with rule.replacement (e.g. "X")
-            "first_last" -> keep only first + last character of matched token
-                            e.g. "Astor" -> "Ar", "Windsor" -> "Wr"
-    """
-    for rule in rules:
-        pat = re.escape(rule.pattern)
-
-        # Build the masking callable
-        if rule.masking_type == "first_last":
-            def _repl(m, _=None):
-                s = m.group(0)
-                return (s[0] + s[-1]) if len(s) > 1 else s
-        else:
-            _rep = rule.replacement or "X"
-            def _repl(m, r=_rep):
-                return r
-
-        try:
-            if rule.position == "prefix":
-                text = re.sub(rf'(?<!\S){pat}\S*', _repl, text, flags=re.IGNORECASE)
-            elif rule.position == "suffix":
-                text = re.sub(rf'\S*{pat}(?!\S)', _repl, text, flags=re.IGNORECASE)
-            elif rule.position == "contains":
-                text = re.sub(rf'\S*{pat}\S*', _repl, text, flags=re.IGNORECASE)
-            else:  # exact
-                text = re.sub(rf'(?<!\S){pat}(?!\S)', _repl, text, flags=re.IGNORECASE)
-        except re.error:
-            pass  # skip malformed patterns gracefully
-    return text
+# ── Masking engine instance ───────────────────────────────────────────────────
+masker = SafeGuardMasker()
 
 
 # ── Pluggable masking interceptor (Step 5 — reusable for any service) ────────
@@ -386,25 +217,7 @@ async def mask_response(request: MaskRequest):
         ORGANIZATION  → <VEHICLE_MODEL>
     • Optional custom_rules are applied on top of Presidio output (Step 4).
     """
-    analyzer, anonymizer = _get_presidio()
-
-    raw = request.raw_response
-
-    # Attempt to parse as JSON for recursive masking; fall back to plain text.
-    try:
-        parsed = json.loads(raw)
-        masked_obj = recursive_mask_data_structure(
-            parsed, analyzer, anonymizer, OPERATORS, PRESIDIO_ENTITIES
-        )
-        masked_text = json.dumps(masked_obj, indent=2)
-    except (json.JSONDecodeError, ValueError):
-        masked_text = recursive_mask_data_structure(
-            raw, analyzer, anonymizer, OPERATORS, PRESIDIO_ENTITIES
-        )
-
-    # Step 4 — Apply user-defined custom word rules on top of Presidio output
-    if request.custom_rules:
-        masked_text = apply_custom_rules(masked_text, request.custom_rules)
+    masked_text = masker.mask(request.raw_response, custom_rules=request.custom_rules)
 
     return {"masked_response": masked_text}
 
