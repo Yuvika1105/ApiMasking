@@ -1,11 +1,30 @@
 # ============================================================
 # safeguard/masker.py
 #
-# Auto PII Masking Engine. See README.md for full instructions.
+# Auto PII Masking Engine
 # 
 # Requires: 
 #   pip install presidio-analyzer presidio-anonymizer spacy
 #   python -m spacy download en_core_web_lg
+#
+# ── HOW TO USE ──────────────────────────────────────────────
+#
+# OPTION A — Automatic Decorator (Recommended)
+#   Add @mask_output above the function that returns your bot's response.
+#
+#   from safeguard.masker import mask_output
+#
+#   @mask_output
+#   def get_bot_reply(prompt):
+#       return call_your_llm(prompt) # Caller will receive MASKED data automatically
+#
+# OPTION B — Manual Call
+#   If you already have a dictionary or string and just want to mask it:
+#
+#   from safeguard.masker import SafeGuardMasker
+#
+#   masker = SafeGuardMasker() # Creates model once
+#   safe_response = masker.mask(your_bot_response)
 # ============================================================
 
 import asyncio
