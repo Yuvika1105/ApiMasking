@@ -1,101 +1,48 @@
-# SafeGuard — Dynamic Data Masking Sandbox
+# SafeGuard PII Masker
 
-End-to-end sandbox demonstrating **decoupled dynamic data masking middleware** using a **Plug-in / Plug-out** architecture. The core masking engine has been refactored into a standalone Python package that can be imported directly into your data pipelines.
+A drop-in Python script that automatically detects and masks Personally Identifiable Information (PII) like Names, Emails, Phone Numbers, and Locations in your chatbot or API responses.
 
-## 📦 Using as a Standalone Package (Backend & Pipelines)
+## Quick Start
 
-You can install the `safeguard` package directly from this repository and use it in any Python backend (Flask, Celery, scripts, etc.) without needing the FastAPI server.
-
-### Installation
-
+### 1. Install Dependencies
+Run these two commands in your terminal once:
 ```bash
-# Install the core package directly from the directory
-pip install .
-
-# Or, if installing from a Git repository:
-pip install git+https://github.com/yourusername/safeguard.git
+pip install presidio-analyzer presidio-anonymizer spacy
+python -m spacy download en_core_web_lg
 ```
 
-### Usage
+### 2. Copy the File
+Just copy `safeguard/masker.py` directly into your own project folder.
+
+### 3. Use It! (Two Options)
+
+#### Option A: Automatic Decorator (Recommended)
+Add `@mask_output` above the function that returns your bot's response. The masking will happen automatically before the data is returned!
+
+```python
+from safeguard.masker import mask_output
+
+@mask_output
+def get_bot_reply(prompt):
+    return call_your_llm(prompt) # Returns raw PII
+
+# Caller receives masked data!
+reply = get_bot_reply("Who is the engineer?") 
+# Example output: "Engineer J**n D*e (XXXXXXX210) will visit <MANUFACTURING_FACILITY>"
+```
+
+#### Option B: Manual Call
+If you already have a dictionary, list, or string and just want to mask it:
 
 ```python
 from safeguard.masker import SafeGuardMasker
 
-# 1. Instantiate the masker (NLP models load once here)
-masker = SafeGuardMasker()
-
-# 2. Prepare your data (string, list, or dict)
-sensitive_data = {
-    "user_id": 12345,
-    "profile": {
-        "name": "John Carter",
-        "contact": {
-            "email": "john.carter@example.com",
-            "phone": "9876543210"
-        }
-    },
-    "location": "Halol Manufacturing Plant"
-}
-
-# 3. Mask the data! The exact JSON structure is preserved.
-masked_data = masker.mask(sensitive_data)
-
-import json
-print(json.dumps(masked_data, indent=2))
+masker = SafeGuardMasker() # Creates model once in memory
+safe_response = masker.mask(your_bot_response)
 ```
 
-**Output:**
-```json
-{
-  "user_id": 12345,
-  "profile": {
-    "name": "J**n C****r",
-    "contact": {
-      "email": "j***n@e*****e.com",
-      "phone": "XXXXXXX210"
-    }
-  },
-  "location": "<MANUFACTURING_FACILITY>"
-}
-```
-
----
-
-## 🌐 Running the Sandbox API Server
-
-The original FastAPI application uses the `safeguard` package under the hood.
-
-### Quick Start
-
-```bash
-# Install with API dependencies
-pip install .[api]
-
-# Start the server
-uvicorn main:app --reload --port 8000
-```
-
-Then open **http://127.0.0.1:8000** in your browser.
-
-## Architecture
-
-```
-Frontend (HTML/JS) → POST /api/v1/query (Mock RAG) → POST /api/v1/mask (SafeGuard Package) → User Display
-```
-
-| Layer | Technology |
-|---|---|
-| UI Gateway | HTML · Vanilla CSS · Async JavaScript |
-| Mock RAG Backend | FastAPI · Python |
-| Masking Package (`safeguard`) | Microsoft Presidio · spaCy `en_core_web_sm` |
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | Frontend UI |
-| `POST` | `/api/v1/query` | Mock RAG — returns sensitive payload |
-| `POST` | `/api/v1/mask` | Presidio masking microservice |
-| `GET` | `/api/v1/queries/samples` | Sample demo queries for UI |
-| `GET` | `/health` | Liveness probe |
-| `GET` | `/docs` | Swagger UI |
+## Features
+- **Works with any format:** Accepts plain text, deeply nested JSON dicts, lists, and SQL query rows.
+- **Context-Free Detection:** Upgraded to the `en_core_web_lg` AI model so it detects isolated locations and names inside SQL table rows and grids without needing surrounding sentences.
+- **Smart Formatting:** Leaves booleans, numbers, and JSON keys completely untouched. Only sensitive string values are changed.
+- **Developer Toggle:** Change `MASKING_ENABLED = False` inside the file during local development to disable masking temporarily.
