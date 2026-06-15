@@ -1,111 +1,11 @@
-
 # ============================================================
-# masker.py — Auto PII Masking for Any Chatbot or API
-# ============================================================
+# safeguard/masker.py
 #
-# This file hides sensitive info (names, emails, phone numbers,
-# locations) inside your bot's JSON responses before they reach
-# the user. It uses Microsoft Presidio + spaCy to detect PII.
-#
-# ── QUICK SETUP (run once in your terminal) ─────────────────
-#
+# Auto PII Masking Engine. See README.md for full instructions.
+# 
+# Requires: 
 #   pip install presidio-analyzer presidio-anonymizer spacy
 #   python -m spacy download en_core_web_lg
-#
-# ── HOW TO USE IN YOUR PROJECT ──────────────────────────────
-#
-#   OPTION A — Decorator (easiest, recommended for real-time bots)
-#   Just add @mask_output above your bot response function:
-#
-#       from safeguard.masker import mask_output
-#
-#       @mask_output                    ← add this one line
-#       def get_bot_reply(prompt):
-#           return call_your_llm(prompt)   # your code unchanged
-#
-#       reply = get_bot_reply("Who is the engineer?")
-#       # reply is already masked — names, emails, phones hidden
-#
-#   OPTION B — Manual call (when you already have the response)
-#
-#       from safeguard.masker import SafeGuardMasker
-#
-#       masker   = SafeGuardMasker()            # create once
-#       raw      = your_bot.get_response(...)   # whatever your bot returns
-#       safe     = masker.mask(raw)             # mask it
-#       send_to_user(safe)                      # send the safe version
-#
-#   OPTION C — FastAPI middleware (masks all JSON responses automatically)
-#
-#       from fastapi import FastAPI, Request
-#       from fastapi.responses import JSONResponse
-#       from safeguard.masker import SafeGuardMasker
-#       import json
-#
-#       app    = FastAPI()
-#       masker = SafeGuardMasker()
-#
-#       @app.middleware("http")
-#       async def auto_mask(request: Request, call_next):
-#           response = await call_next(request)
-#           if "application/json" in response.headers.get("content-type", ""):
-#               body = b""
-#               async for chunk in response.body_iterator:
-#                   body += chunk
-#               masked = masker.mask(json.loads(body))
-#               return JSONResponse(content=masked, status_code=response.status_code)
-#           return response
-#
-#   OPTION D — Flask (masks all JSON responses automatically)
-#
-#       from flask import Flask
-#       from safeguard.masker import SafeGuardMasker
-#       import json
-#
-#       app    = Flask(__name__)
-#       masker = SafeGuardMasker()
-#
-#       @app.after_request
-#       def auto_mask(response):
-#           if "application/json" in response.content_type:
-#               masked = masker.mask(response.get_json(silent=True) or {})
-#               response.set_data(json.dumps(masked))
-#           return response
-#
-# ── TURN MASKING ON / OFF ────────────────────────────────────
-#
-#   Change MASKING_ENABLED below (or flip it from your code):
-#
-#       import safeguard.masker as m
-#       m.MASKING_ENABLED = False   # OFF — useful during development
-#       m.MASKING_ENABLED = True    # ON  — use in production
-#
-# ── WHAT GETS MASKED ────────────────────────────────────────
-#
-#   Names        John Carter   →  J**n C****r
-#   Phones       9876543210    →  XXXXXXX210
-#   Emails       john@ex.com   →  j**n@e*.com
-#   Locations    Halol Plant   →  <MANUFACTURING_FACILITY>
-#   Orgs         ACME Corp     →  <VEHICLE_MODEL>
-#
-#   Numbers, booleans, and JSON keys are NEVER touched.
-#
-# ── CUSTOM RULES (optional) ──────────────────────────────────
-#
-#   For tokens Presidio won't catch (e.g. VINs, employee IDs):
-#
-#       rules = [
-#           {"pattern": "VIN", "position": "prefix",
-#            "masking_type": "replace", "replacement": "[VIN-HIDDEN]"},
-#       ]
-#       safe = masker.mask(response, custom_rules=rules)
-#
-# ── VERIFY SETUP ─────────────────────────────────────────────
-#
-#   python safeguard/masker.py
-#
-#   Prints a before/after demo so you can see masking in action.
-#
 # ============================================================
 
 import asyncio
@@ -341,21 +241,8 @@ def _get_shared_masker() -> SafeGuardMasker:
 
 
 # ============================================================
-# @mask_output — decorator for real-time automatic masking
-# ============================================================
+# @mask_output — decorator for automatic masking
 # Add this above any function that returns a bot / LLM response.
-# The function itself stays completely unchanged.
-# Every time it returns, the output is automatically masked.
-#
-# Works with both regular and async functions.
-#
-# Example:
-#   @mask_output
-#   def get_reply(prompt):
-#       return call_llm(prompt)   # returns raw PII
-#
-#   reply = get_reply("Who is the engineer?")
-#   # reply is already masked — caller never sees raw PII
 # ============================================================
 
 def mask_output(func: Callable) -> Callable:
