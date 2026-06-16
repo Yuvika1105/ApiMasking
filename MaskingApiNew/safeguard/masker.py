@@ -9,22 +9,24 @@
 #
 # ── HOW TO USE ──────────────────────────────────────────────
 #
-# OPTION A — Automatic Decorator (Recommended)
-#   Add @mask_output above the function that returns your bot's response.
-#
+# OPTION A — Automatic Decorator
 #   from safeguard.masker import mask_output
 #
 #   @mask_output
 #   def get_bot_reply(prompt):
-#       return call_your_llm(prompt) # Caller will receive MASKED data automatically
+#       return call_your_llm(prompt)
 #
-# OPTION B — Manual Call
-#   If you already have a dictionary or string and just want to mask it:
+# OPTION B — Manual Function
+#   from safeguard.masker import mask
 #
-#   from safeguard.masker import SafeGuardMasker
+#   safe_response = mask(your_bot_response)
+#   
+#   # Or with a report:
+#   safe_data = mask(your_bot_response, return_report=True)
 #
-#   masker = SafeGuardMasker() # Creates model once
-#   safe_response = masker.mask(your_bot_response)
+# OPTION C — FastAPI Middleware
+#   from safeguard.masker import SafeGuardMiddleware
+#   app.add_middleware(SafeGuardMiddleware)
 # ============================================================
 
 import asyncio
@@ -32,76 +34,165 @@ import functools
 import json
 import os
 import re
-from typing import Any, Callable, List
+import threading
+from typing import Any, Callable, List, Dict, Tuple, Optional
 
-from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, PatternRecognizer, Pattern
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
+# Try to import Starlette for Middleware support
+try:
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
+    from starlette.types import ASGIApp
+    STARLETTE_AVAILABLE = True
+except ImportError:
+    STARLETTE_AVAILABLE = False
+
 
 # ── Middleware toggle ────────────────────────────────────────
-# True  = masking is ON  (default — use in production)
-# False = masking is OFF (useful while developing/debugging)
-# Can also be set via environment variable: SAFEGUARD_ENABLED=false
 MASKING_ENABLED: bool = os.environ.get("SAFEGUARD_ENABLED", "true").lower() != "false"
+
+# ── Verhoeff Checksum for Aadhaar Validation ─────────────────
+_d = (
+    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+    (1, 2, 3, 4, 0, 6, 7, 8, 9, 5),
+    (2, 3, 4, 0, 1, 7, 8, 9, 5, 6),
+    (3, 4, 0, 1, 2, 8, 9, 5, 6, 7),
+    (4, 0, 1, 2, 3, 9, 5, 6, 7, 8),
+    (5, 9, 8, 7, 6, 0, 4, 3, 2, 1),
+    (6, 5, 9, 8, 7, 1, 0, 4, 3, 2),
+    (7, 6, 5, 9, 8, 2, 1, 0, 4, 3),
+    (8, 7, 6, 5, 9, 3, 2, 1, 0, 4),
+    (9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+)
+_p = (
+    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+    (1, 5, 7, 6, 2, 8, 3, 0, 9, 4),
+    (5, 8, 0, 3, 7, 9, 6, 1, 4, 2),
+    (8, 9, 1, 6, 0, 4, 3, 5, 2, 7),
+    (9, 4, 5, 3, 1, 2, 6, 8, 7, 0),
+    (4, 2, 8, 6, 5, 7, 3, 9, 0, 1),
+    (2, 7, 9, 3, 8, 0, 6, 4, 1, 5),
+    (7, 0, 4, 6, 9, 1, 3, 2, 5, 8)
+)
+
+def validate_aadhaar(text: str) -> bool:
+    c = 0
+    num = text.replace(' ', '')
+    if len(num) != 12 or not num.isdigit():
+        return False
+    inv_array = [int(n) for n in num][::-1]
+    for i in range(len(inv_array)):
+        c = _d[c][_p[i % 8][inv_array[i]]]
+    return c == 0
 
 
 # ============================================================
 # SafeGuardMasker — the core masking class
 # ============================================================
-# You create one instance of this at startup and reuse it.
-# It loads the NLP model once and keeps it in memory.
 
 class SafeGuardMasker:
     """
-    Masks PII in any string, dict, or list using Microsoft Presidio + spaCy.
-    Create once, call .mask() as many times as needed.
+    Masks PII in any string, dict, or list using Microsoft Presidio.
     """
 
-    # These are the entity types that will be detected and masked.
-    # Add or remove types here if you need to handle more/fewer.
-    PRESIDIO_ENTITIES = ["PERSON", "LOCATION", "ORGANIZATION", "PHONE_NUMBER", "EMAIL_ADDRESS"]
+    DEFAULT_ENTITIES = [
+        "PERSON", "LOCATION", "ORGANIZATION", "PHONE_NUMBER", "EMAIL_ADDRESS",
+        "CREDIT_CARD", "US_PASSPORT", "IP_ADDRESS", "US_BANK_NUMBER",
+        "US_DRIVER_LICENSE", "URL", "AADHAAR", "PAN_CARD", "VIN", "EMPLOYEE_ID"
+    ]
 
-    def __init__(self):
-        # Download the spaCy English model automatically if it's not installed.
-        try:
-            import spacy
-            import spacy.util
-            if not spacy.util.is_package("en_core_web_lg"):
-                spacy.cli.download("en_core_web_lg")
-        except Exception as e:
-            print(f"[SafeGuard] Could not auto-download spaCy model: {e}")
-            print("[SafeGuard] Run manually: python -m spacy download en_core_web_lg")
+    def __init__(
+        self, 
+        score_threshold: float = 0.7, 
+        field_masks: Dict[str, str] = None,
+        allowlist: List[str] = None,
+        mode: str = "accurate"  # "accurate" or "fast"
+    ):
+        self.score_threshold = score_threshold
+        self.field_masks = {k.lower(): v for k, v in (field_masks or {}).items()}
+        self.allowlist = [w.lower() for w in (allowlist or [])]
+        self.mode = mode
 
-        # Set up Presidio — the NLP engine that finds PII.
+        # Validate spaCy model installation if in accurate mode
+        if self.mode == "accurate":
+            try:
+                import spacy.util
+                if not spacy.util.is_package("en_core_web_lg"):
+                    raise RuntimeError("Model 'en_core_web_lg' not found. Please install it using: python -m spacy download en_core_web_lg")
+            except ImportError:
+                raise RuntimeError("spaCy is not installed. Please install it via pip.")
+
         registry = RecognizerRegistry()
         registry.load_predefined_recognizers()
 
-        spacy_config = {
-            "nlp_engine_name": "spacy",
-            "models": [{"lang_code": "en", "model_name": "en_core_web_lg"}],
-        }
-        nlp_provider = NlpEngineProvider(nlp_configuration=spacy_config)
-        nlp_engine = nlp_provider.create_engine()
+        # Add Custom Recognizers
+        aadhaar_recognizer = PatternRecognizer(
+            supported_entity="AADHAAR",
+            patterns=[Pattern("AADHAAR", r"\b\d{4}\s?\d{4}\s?\d{4}\b", 0.8)]
+        )
+        pan_recognizer = PatternRecognizer(
+            supported_entity="PAN_CARD",
+            patterns=[Pattern("PAN_CARD", r"\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b", 0.8)],
+            context=["pan", "permanent account number"]
+        )
+        vin_recognizer = PatternRecognizer(
+            supported_entity="VIN",
+            patterns=[Pattern("VIN", r"\b[A-HJ-NPR-Z0-9]{17}\b", 0.8)]
+        )
+        employee_id_recognizer = PatternRecognizer(
+            supported_entity="EMPLOYEE_ID",
+            patterns=[Pattern("EMPLOYEE_ID", r"\b(?:EMP|ID)-?\d{4,8}\b", 0.6)]
+        )
+        phone_recognizer = PatternRecognizer(
+            supported_entity="PHONE_NUMBER",
+            patterns=[Pattern("PHONE_NUMBER", r"(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?[2-9]\d{2}[-.\s]?\d{4}\b", 0.7)]
+        )
 
-        self._analyzer   = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
+        registry.add_recognizer(aadhaar_recognizer)
+        registry.add_recognizer(pan_recognizer)
+        registry.add_recognizer(vin_recognizer)
+        registry.add_recognizer(employee_id_recognizer)
+        registry.add_recognizer(phone_recognizer)
+
+        # Validate that default entities exist in the registry
+        loaded_recognizers = registry.recognizers
+        supported_entities = set()
+        for rec in loaded_recognizers:
+            supported_entities.update(rec.supported_entities)
+            
+        self.active_entities = [e for e in self.DEFAULT_ENTITIES if e in supported_entities]
+
+        if self.mode == "accurate":
+            spacy_config = {
+                "nlp_engine_name": "spacy",
+                "models": [{"lang_code": "en", "model_name": "en_core_web_lg"}],
+            }
+            nlp_provider = NlpEngineProvider(nlp_configuration=spacy_config)
+            nlp_engine = nlp_provider.create_engine()
+            self._analyzer = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
+        else:
+            # Fast mode: No NLP, regex only
+            self._analyzer = AnalyzerEngine(registry=registry)
+
         self._anonymizer = AnonymizerEngine()
 
-        # How each entity type gets masked.
-        # Change the "new_value" strings here to use different replacement tags.
         self.operators = {
             "PERSON":        OperatorConfig("custom",  {"lambda": self._mask_name}),
-            "LOCATION":      OperatorConfig("replace", {"new_value": "<MANUFACTURING_FACILITY>"}),
-            "ORGANIZATION":  OperatorConfig("replace", {"new_value": "<VEHICLE_MODEL>"}),
             "PHONE_NUMBER":  OperatorConfig("custom",  {"lambda": self._mask_phone}),
             "EMAIL_ADDRESS": OperatorConfig("custom",  {"lambda": self._mask_email}),
         }
+        # For all other entities, replace with <ENTITY_TYPE>
+        for entity in self.active_entities:
+            if entity not in self.operators:
+                self.operators[entity] = OperatorConfig("replace", {"new_value": f"<{entity}>"})
 
-    # ── Masking helpers (one per entity type) ────────────────
-
+    # ── Masking helpers ────────────────
     def _mask_name(self, text: str) -> str:
-        # Keeps first and last letter of each word: John Carter → J**n C****r
         parts = text.split()
         masked = []
         for part in parts:
@@ -112,7 +203,6 @@ class SafeGuardMasker:
         return ' '.join(masked)
 
     def _mask_phone(self, text: str) -> str:
-        # Shows only the last 3 digits: 9876543210 → XXXXXXX210
         digits = re.sub(r'\D', '', text)
         if not digits or len(digits) <= 3:
             return 'X' * len(text)
@@ -128,7 +218,6 @@ class SafeGuardMasker:
         return ''.join(result)
 
     def _mask_email(self, text: str) -> str:
-        # Hides most of the email: john@gmail.com → j**n@g**l.com
         try:
             local, domain = text.split('@', 1)
             d_parts = domain.rsplit('.', 1)
@@ -146,20 +235,12 @@ class SafeGuardMasker:
 
     # ── Main public method ───────────────────────────────────
 
-    def mask(self, data: Any, custom_rules: List[Any] = None) -> Any:
-        """
-        Mask PII in data. Call this wherever your bot returns a response.
-
-        Accepts: dict, list, JSON string, or plain string.
-        Returns: same type as input, with PII replaced.
-
-        If MASKING_ENABLED is False, returns data unchanged (no-op).
-        """
-        # If masking is turned OFF globally, return data as-is.
+    def mask(self, data: Any, custom_rules: List[Any] = None, return_report: bool = False) -> Any:
         if not MASKING_ENABLED:
+            if return_report:
+                return {"masked_response": data, "entity_types": {}}
             return data
 
-        # If the input is a JSON string, parse it so we can walk its values.
         is_string_json = False
         parsed_data    = data
         if isinstance(data, str):
@@ -167,50 +248,97 @@ class SafeGuardMasker:
                 parsed_data    = json.loads(data)
                 is_string_json = True
             except (json.JSONDecodeError, ValueError):
-                pass  # not JSON — treat as plain text
+                pass 
 
-        # Recursively mask every string value in the data.
-        masked_obj = self._recursive_mask(parsed_data)
+        report_tracker = {}
 
-        # Return in the same format the caller passed in.
+        masked_obj = self._recursive_mask(parsed_data, report_tracker=report_tracker)
+
         if is_string_json:
             masked_text = json.dumps(masked_obj, indent=2)
         elif isinstance(data, str):
             masked_text = masked_obj
         else:
-            masked_text = masked_obj  # dict or list — keep as-is
+            masked_text = masked_obj
 
-        # Apply any extra custom word rules on top of Presidio's output.
         if custom_rules:
             if not isinstance(masked_text, str):
                 masked_text = json.dumps(masked_text, indent=2)
                 masked_text = self._apply_custom_rules(masked_text, custom_rules)
                 try:
-                    return json.loads(masked_text)
+                    masked_text = json.loads(masked_text)
                 except Exception:
-                    return masked_text
+                    pass
             else:
                 masked_text = self._apply_custom_rules(masked_text, custom_rules)
 
+        if return_report:
+            return {
+                "masked_response": masked_text,
+                "entity_types": report_tracker
+            }
+        
         return masked_text
 
-    def _recursive_mask(self, data: Any) -> Any:
-        # Walk dicts, lists, and strings — mask every string value.
-        # Keys, numbers, booleans are never changed.
+    def _apply_field_mask(self, value: str, entity_type: str) -> str:
+        # Instead of just replacing with <TAG>, run the actual operator on the value
+        if entity_type in self.operators:
+            operator = self.operators[entity_type]
+            if operator.operator_name == "replace":
+                return operator.params.get("new_value", f"<{entity_type}>")
+            elif operator.operator_name == "custom":
+                func = operator.params.get("lambda")
+                if func:
+                    return func(value)
+        return f"<{entity_type}>"
+
+    def _recursive_mask(self, data: Any, report_tracker: dict, current_key: str = None) -> Any:
         if isinstance(data, dict):
-            return {k: self._recursive_mask(v) for k, v in data.items()}
+            return {k: self._recursive_mask(v, report_tracker, current_key=k) for k, v in data.items()}
         elif isinstance(data, list):
-            return [self._recursive_mask(i) for i in data]
+            # Run synchronously to avoid thread-creation overhead for small/medium arrays
+            return [self._recursive_mask(i, report_tracker, current_key=current_key) for i in data]
         elif isinstance(data, str):
-            results = self._analyzer.analyze(text=data, language="en", entities=self.PRESIDIO_ENTITIES)
+            # Field-aware masking logic
+            if current_key and current_key.lower() in self.field_masks:
+                entity_type = self.field_masks[current_key.lower()]
+                if entity_type == "AADHAAR" and not validate_aadhaar(data):
+                    return data # Do not fall through to NLP masking if field is aadhaar but invalid
+                else:
+                    report_tracker[entity_type] = report_tracker.get(entity_type, 0) + 1
+                    return self._apply_field_mask(data, entity_type)
+
+            # NLP based masking
+            results = self._analyzer.analyze(
+                text=data, 
+                language="en", 
+                entities=self.active_entities,
+                score_threshold=self.score_threshold
+            )
+            
+            # Filter results
+            filtered_results = []
+            for res in results:
+                # Verhoeff check for Aadhaar
+                if res.entity_type == "AADHAAR":
+                    extracted = data[res.start:res.end]
+                    if not validate_aadhaar(extracted):
+                        continue
+                
+                # Allowlist check
+                extracted_lower = data[res.start:res.end].lower()
+                if extracted_lower in self.allowlist:
+                    continue
+
+                filtered_results.append(res)
+                report_tracker[res.entity_type] = report_tracker.get(res.entity_type, 0) + 1
+                
             return self._anonymizer.anonymize(
-                text=data, analyzer_results=results, operators=self.operators
+                text=data, analyzer_results=filtered_results, operators=self.operators
             ).text
-        return data  # numbers, booleans, None — unchanged
+        return data
 
     def _apply_custom_rules(self, text: str, rules: List[Any]) -> str:
-        # Apply user-defined word rules (e.g. VIN numbers, employee IDs).
-        # Each rule is a dict with: pattern, position, masking_type, replacement.
         for rule in rules:
             pattern      = rule.pattern      if hasattr(rule, 'pattern')      else rule.get('pattern', '')
             position     = rule.position     if hasattr(rule, 'position')     else rule.get('position', 'prefix')
@@ -235,156 +363,170 @@ class SafeGuardMasker:
                     text = re.sub(rf'\S*{pat}(?!\S)',    _repl, text, flags=re.IGNORECASE)
                 elif position == "contains":
                     text = re.sub(rf'\S*{pat}\S*',       _repl, text, flags=re.IGNORECASE)
-                else:  # exact match
+                else:
                     text = re.sub(rf'(?<!\S){pat}(?!\S)', _repl, text, flags=re.IGNORECASE)
             except re.error:
-                pass  # skip bad patterns silently
+                pass
         return text
 
 
 # ============================================================
-# Shared masker — one instance reused by the @mask_output decorator.
-# You can also import this directly:
-#   from safeguard.masker import _get_shared_masker
-#   safe = _get_shared_masker().mask(bot_response)
+# Shared masker — one instance reused by the decorators/functions
 # ============================================================
 
 _shared_masker: SafeGuardMasker = None
+_masker_lock = threading.Lock()
 
 def _get_shared_masker() -> SafeGuardMasker:
-    """Returns the shared masker, creating it on first use."""
+    """Returns the shared masker, creating it on first use safely."""
     global _shared_masker
     if _shared_masker is None:
-        _shared_masker = SafeGuardMasker()
+        with _masker_lock:
+            if _shared_masker is None:
+                _shared_masker = SafeGuardMasker(
+                    score_threshold=0.7,
+                    field_masks={
+                        "customer_name": "PERSON",
+                        "employee_id": "EMPLOYEE_ID",
+                        "aadhaar": "AADHAAR",
+                        "pan": "PAN_CARD"
+                    },
+                    allowlist=["openai", "microsoft", "google"]
+                )
     return _shared_masker
 
+def configure(allowlist: List[str] = None, threshold: float = None, mode: str = None, field_masks: Dict[str, str] = None):
+    """Configures the shared masker instance. Must be called before first use, or re-initializes it."""
+    global _shared_masker
+    with _masker_lock:
+        if _shared_masker is not None:
+            old_allowlist = _shared_masker.allowlist
+            old_threshold = _shared_masker.score_threshold
+            old_mode = _shared_masker.mode
+            old_field_masks = _shared_masker.field_masks
+            
+            _shared_masker = SafeGuardMasker(
+                score_threshold=threshold if threshold is not None else old_threshold,
+                field_masks=field_masks if field_masks is not None else old_field_masks,
+                allowlist=allowlist if allowlist is not None else old_allowlist,
+                mode=mode if mode is not None else old_mode
+            )
+        else:
+            _shared_masker = SafeGuardMasker(
+                score_threshold=threshold if threshold is not None else 0.7,
+                field_masks=field_masks if field_masks is not None else {
+                    "customer_name": "PERSON",
+                    "employee_id": "EMPLOYEE_ID",
+                    "aadhaar": "AADHAAR",
+                    "pan": "PAN_CARD"
+                },
+                allowlist=allowlist if allowlist is not None else ["openai", "microsoft", "google"],
+                mode=mode if mode is not None else "accurate"
+            )
+
 
 # ============================================================
-# @mask_output — decorator for automatic masking
-# Add this above any function that returns a bot / LLM response.
+# Public API
 # ============================================================
+
+def mask(data: Any, custom_rules: List[Any] = None, return_report: bool = False) -> Any:
+    """
+    Mask PII in data.
+    Accepts: dict, list, JSON string, or plain string.
+    Returns: same type as input, with PII replaced.
+    """
+    return _get_shared_masker().mask(data, custom_rules=custom_rules, return_report=return_report)
 
 def mask_output(func: Callable) -> Callable:
     """
     Decorator: auto-masks the return value of any bot/LLM function.
-    Respects MASKING_ENABLED — set it to False to bypass masking.
     """
     if asyncio.iscoroutinefunction(func):
-        # Handle async functions (e.g. FastAPI route handlers)
         @functools.wraps(func)
         async def async_wrapper(*args, **kwargs):
-            result = await func(*args, **kwargs)  # run the original function
+            result = await func(*args, **kwargs)
             if not MASKING_ENABLED:
-                return result                     # skip masking if toggle is OFF
+                return result
             try:
-                return _get_shared_masker().mask(result)  # mask and return
+                return _get_shared_masker().mask(result)
             except Exception as e:
                 print(f"[SafeGuard] Masking failed, returning original: {e}")
                 return result
         return async_wrapper
     else:
-        # Handle regular (sync) functions
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
-            result = func(*args, **kwargs)        # run the original function
+            result = func(*args, **kwargs)
             if not MASKING_ENABLED:
-                return result                     # skip masking if toggle is OFF
+                return result
             try:
-                return _get_shared_masker().mask(result)  # mask and return
+                return _get_shared_masker().mask(result)
             except Exception as e:
                 print(f"[SafeGuard] Masking failed, returning original: {e}")
                 return result
         return sync_wrapper
 
+# ============================================================
+# FastAPI / Starlette Middleware
+# ============================================================
 
-# ============================================================
-# Run this file directly to see a live demo:
-#   python safeguard/masker.py
-# ============================================================
+if STARLETTE_AVAILABLE:
+    class SafeGuardMiddleware(BaseHTTPMiddleware):
+        """
+        FastAPI / Starlette Middleware to automatically mask all outgoing JSON responses.
+        
+        Usage:
+            from fastapi import FastAPI
+            from safeguard.masker import SafeGuardMiddleware
+            
+            app = FastAPI()
+            app.add_middleware(SafeGuardMiddleware)
+        """
+        def __init__(self, app: ASGIApp, masker: Optional[SafeGuardMasker] = None):
+            super().__init__(app)
+            self.masker = masker or _get_shared_masker()
+
+        async def dispatch(self, request: Request, call_next: Callable) -> Response:
+            response = await call_next(request)
+            
+            if not MASKING_ENABLED:
+                return response
+
+            # Skip streaming responses to prevent breaking token streams
+            if response.__class__.__name__ == "StreamingResponse":
+                return response
+
+            if isinstance(response, JSONResponse) or response.headers.get("content-type") == "application/json":
+                # Extract body
+                if not hasattr(response, "body_iterator"):
+                    return response
+                body_iterator = response.body_iterator
+                body = b"".join([chunk async for chunk in body_iterator])
+                try:
+                    data = json.loads(body)
+                    masked_data = self.masker.mask(data)
+                    return JSONResponse(content=masked_data, status_code=response.status_code)
+                except Exception:
+                    # If JSON parsing fails, return original
+                    return Response(content=body, status_code=response.status_code, headers=dict(response.headers))
+            
+            return response
 
 if __name__ == "__main__":
-
     print("\n" + "=" * 60)
-    print("  SafeGuard Masker — Live Demo")
+    print("  SafeGuard Masker — Enterprise Demo")
     print("=" * 60)
 
-    # ── Demo 1: @mask_output decorator ──────────────────────
-    # This is the recommended way for real-time bots.
-    # Just add @mask_output above your bot response function.
-    # The function body never changes.
-
-    @mask_output  # ← this one line is all you add in your project
-    def simulate_bot_response(user_prompt: str) -> dict:
-        # In your real project, this would call your actual LLM:
-        #   return openai_client.chat.completions.create(...)
-        #   return gemini_model.generate_content(user_prompt).text
-        #   return your_rag_pipeline.query(user_prompt)
-        #
-        # Here we return fake data to show the demo:
-        return {
-            "answer": (
-                f"Re: '{user_prompt}' — "
-                "Technician John Carter (john.carter@acme.com, "
-                "+91-9876543210) will visit Halol Plant for ACME Corp."
-            ),
-            "ticket_id":  4821,   # number  — will NOT be masked
-            "confidence": 0.97,   # float   — will NOT be masked
-            "escalated":  False,  # boolean — will NOT be masked
-            "metadata": {
-                "raised_by": "Alice Sharma",      # name  — WILL be masked
-                "contact":   "alice@example.com", # email — WILL be masked
-            },
-        }
-
-    # Call the bot just like you normally would.
-    # Masking happens automatically before the result comes back.
-    USER_PROMPT = "What is the status of the technician visit?"
-
-    print("\n[Demo 1]  @mask_output — automatic real-time masking")
-    print("-" * 50)
-    result = simulate_bot_response(USER_PROMPT)
-    print(f"User asked : {USER_PROMPT}")
-    print(f"\nBot replied (already masked):")
-    print(json.dumps(result, indent=2))
-
-    # ── Demo 2: masker.mask() manual call ───────────────────
-    # Use this when you already have the bot's response
-    # as a variable and want to mask it before sending it on.
-
-    print("\n\n[Demo 2]  masker.mask() — manual call")
-    print("-" * 50)
-
-    # ↓ Replace this with your actual bot/LLM response
-    YOUR_BOT_RESPONSE = {
-        "answer": "Engineer David Lee (david@corp.com, 9000012345) filed a report at Sanand Plant.",
-        "ref_id": 99,   # number — will NOT be masked
+    bot_response = {
+        "customer_name": "May Jordan",
+        "aadhaar": "456789012345", # Not mathematically valid, shouldn't mask
+        "employee_id": "EMP-4921",
+        "details": "Customer May lives in New York and works for OpenAI. Her VIN is 1HGCM82633A00435.",
+        "ip_address": "192.168.1.1"
     }
-    # ↑ e.g. response.choices[0].message.content  or  response.text
 
-    masker = SafeGuardMasker()        # create once at app startup
-    MASKED_RESPONSE = masker.mask(YOUR_BOT_RESPONSE)   # ← masking call
-
-    print("Raw   :", json.dumps(YOUR_BOT_RESPONSE))
-    print("Masked:", json.dumps(MASKED_RESPONSE))
-
-    # ── Demo 3: middleware toggle ────────────────────────────
-    # Set MASKING_ENABLED = False to disable masking globally.
-    # Useful when debugging locally and you need to see raw output.
-
-    print("\n\n[Demo 3]  MASKING_ENABLED = False (pass-through mode)")
+    print("\n[Demo] mask() function with return_report=True")
     print("-" * 50)
-
-    MASKING_ENABLED = False   # masking is now OFF
-
-    raw_result = simulate_bot_response(USER_PROMPT)
-    print("Output (masking OFF — raw, no PII hidden):")
-    print(json.dumps(raw_result, indent=2))
-
-    MASKING_ENABLED = True    # turn masking back ON
-    print("\nMASKING_ENABLED reset to True — masking is active again.")
-
-    print("\n" + "=" * 60)
-    print("  In your project, choose either:")
-    print("    @mask_output   above your bot function  (automatic)")
-    print("    masker.mask()  wherever you return data (manual)")
-    print("=" * 60 + "\n")
+    
+    report = mask(bot_response, return_report=True)
+    print(json.dumps(report, indent=2))
