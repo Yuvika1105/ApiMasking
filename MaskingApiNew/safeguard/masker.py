@@ -101,22 +101,30 @@ class SafeGuardMasker:
     """
 
     DEFAULT_ENTITIES = [
-        "PERSON", "LOCATION", "ORGANIZATION", "PHONE_NUMBER", "EMAIL_ADDRESS",
+        "PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS",
         "CREDIT_CARD", "US_PASSPORT", "IP_ADDRESS", "US_BANK_NUMBER",
         "US_DRIVER_LICENSE", "URL", "AADHAAR", "PAN_CARD", "VIN", "EMPLOYEE_ID"
     ]
 
+    # Entities that carry high false-positive risk on structured/tabular data.
+    # ORGANIZATION and LOCATION are excluded by default because codes like
+    # "Dealer_XVG0FN" or product SKUs are routinely misclassified by spaCy NER.
+    # Add them back via SafeGuardMasker(entities=[...]) if needed.
+    HIGH_FP_ENTITIES = ["ORGANIZATION", "LOCATION"]
+
     def __init__(
         self, 
-        score_threshold: float = 0.7, 
+        score_threshold: float = 0.85, 
         field_masks: Dict[str, str] = None,
         allowlist: List[str] = None,
-        mode: str = "accurate"  # "accurate" or "fast"
+        mode: str = "accurate",  # "accurate" or "fast"
+        entities: List[str] = None  # override DEFAULT_ENTITIES if needed
     ):
         self.score_threshold = score_threshold
         self.field_masks = {k.lower(): v for k, v in (field_masks or {}).items()}
         self.allowlist = [w.lower() for w in (allowlist or [])]
         self.mode = mode
+        self._custom_entities = entities  # None = use DEFAULT_ENTITIES
 
         # Validate spaCy model installation if in accurate mode
         if self.mode == "accurate":
@@ -146,11 +154,11 @@ class SafeGuardMasker:
         )
         employee_id_recognizer = PatternRecognizer(
             supported_entity="EMPLOYEE_ID",
-            patterns=[Pattern("EMPLOYEE_ID", r"\b(?:EMP|ID)-?\d{4,8}\b", 0.6)]
+            patterns=[Pattern("EMPLOYEE_ID", r"\b(?:EMP|ID)-?\d{4,8}\b", 0.9)]
         )
         phone_recognizer = PatternRecognizer(
             supported_entity="PHONE_NUMBER",
-            patterns=[Pattern("PHONE_NUMBER", r"(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?[2-9]\d{2}[-.\s]?\d{4}\b", 0.7)]
+            patterns=[Pattern("PHONE_NUMBER", r"(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?[2-9]\d{2}[-.\s]?\d{4}\b", 0.9)]
         )
 
         registry.add_recognizer(aadhaar_recognizer)
@@ -165,7 +173,8 @@ class SafeGuardMasker:
         for rec in loaded_recognizers:
             supported_entities.update(rec.supported_entities)
             
-        self.active_entities = [e for e in self.DEFAULT_ENTITIES if e in supported_entities]
+        entity_pool = self._custom_entities if self._custom_entities is not None else self.DEFAULT_ENTITIES
+        self.active_entities = [e for e in entity_pool if e in supported_entities]
 
         if self.mode == "accurate":
             spacy_config = {
@@ -302,7 +311,9 @@ class SafeGuardMasker:
             # Field-aware masking logic
             if current_key and current_key.lower() in self.field_masks:
                 entity_type = self.field_masks[current_key.lower()]
-                if entity_type == "AADHAAR" and not validate_aadhaar(data):
+                if entity_type is None or entity_type.upper() in ["IGNORE", "SKIP"]:
+                    return data
+                elif entity_type == "AADHAAR" and not validate_aadhaar(data):
                     return data # Do not fall through to NLP masking if field is aadhaar but invalid
                 else:
                     report_tracker[entity_type] = report_tracker.get(entity_type, 0) + 1
@@ -384,7 +395,7 @@ def _get_shared_masker() -> SafeGuardMasker:
         with _masker_lock:
             if _shared_masker is None:
                 _shared_masker = SafeGuardMasker(
-                    score_threshold=0.7,
+                    score_threshold=0.85,
                     field_masks={
                         "customer_name": "PERSON",
                         "employee_id": "EMPLOYEE_ID",
@@ -413,7 +424,7 @@ def configure(allowlist: List[str] = None, threshold: float = None, mode: str = 
             )
         else:
             _shared_masker = SafeGuardMasker(
-                score_threshold=threshold if threshold is not None else 0.7,
+                score_threshold=threshold if threshold is not None else 0.85,
                 field_masks=field_masks if field_masks is not None else {
                     "customer_name": "PERSON",
                     "employee_id": "EMPLOYEE_ID",
